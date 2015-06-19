@@ -180,7 +180,7 @@ def main(argv):
     # moving the login up here and passing in the connection
     #
     start = time.time()
-    err, con = mongo_connect(host, port, ssl, user, passwd, replicaset)
+    err, con, nagiosCon = mongo_connect(host, port, ssl, user, passwd, replicaset, database)
     if err != 0:
         return err
 
@@ -241,7 +241,7 @@ def main(argv):
     elif action == "replica_primary":
         return check_replica_primary(con, host, warning, critical, perf_data, replicaset, mongo_version)
     elif action == "queries_per_second":
-        return check_queries_per_second(con, query_type, warning, critical, perf_data, mongo_version)
+        return check_queries_per_second(con, nagiosCon, query_type, warning, critical, perf_data, mongo_version)
     elif action == "page_faults":
         check_page_faults(con, sample_time, warning, critical, perf_data)
     elif action == "chunks_balance":
@@ -258,12 +258,13 @@ def main(argv):
         return check_connect(host, port, warning, critical, perf_data, user, passwd, conn_time)
 
 
-def mongo_connect(host=None, port=None, ssl=False, user=None, passwd=None, replica=None):
+def mongo_connect(host=None, port=None, ssl=False, user=None, passwd=None, replica=None, database=None):
     try:
         # ssl connection for pymongo > 2.3
         if pymongo.version >= "2.3":
             if replica is None:
-                con = pymongo.MongoClient(host, port)
+                adminCon = pymongo.MongoClient(host, port)
+                nagiosCon = pymongo.MongoClient(host, port)
             else:
                 con = pymongo.Connection(host, port, read_preference=pymongo.ReadPreference.SECONDARY, ssl=ssl, replicaSet=replica, network_timeout=10)
         else:
@@ -274,9 +275,12 @@ def mongo_connect(host=None, port=None, ssl=False, user=None, passwd=None, repli
                 #con = pymongo.Connection(host, port, slave_okay=True, replicaSet=replica, network_timeout=10)
 
         if user and passwd:
-            db = con["admin"]
-            if not db.authenticate(user, passwd):
-                sys.exit("Username/Password incorrect")
+            adminDB = adminCon["admin"]
+            if not adminDB.authenticate(user, passwd):
+                sys.exit("Username/Password incorrect for admin DB")
+            nagiosDB = nagiosCon["nagios"]
+            if not nagiosDB.authenticate(user, passwd):
+                sys.exit("Username/Password incorrect for nagios DB")
     except Exception, e:
         if isinstance(e, pymongo.errors.AutoReconnect) and str(e).find(" is an arbiter") != -1:
             # We got a pymongo AutoReconnect exception that tells us we connected to an Arbiter Server
@@ -284,7 +288,7 @@ def mongo_connect(host=None, port=None, ssl=False, user=None, passwd=None, repli
             print "OK - State: 7 (Arbiter)"
             sys.exit(0)
         return exit_with_general_critical(e), None
-    return 0, con
+    return 0, adminCon, nagiosCon
 
 
 def exit_with_general_warning(e):
@@ -952,7 +956,7 @@ def check_collection_size(con, database, collection, warning, critical, perf_dat
     except Exception, e:
         return exit_with_general_critical(e)
 
-def check_queries_per_second(con, query_type, warning, critical, perf_data, mongo_version):
+def check_queries_per_second(con, nagiosCon, query_type, warning, critical, perf_data, mongo_version):
     warning = warning or 250
     critical = critical or 500
 
@@ -960,14 +964,15 @@ def check_queries_per_second(con, query_type, warning, critical, perf_data, mong
         return exit_with_general_critical("The query type of '%s' is not valid" % query_type)
 
     try:
-        db = con.local
         data = get_server_status(con)
 
         # grab the count
         num = int(data['opcounters'][query_type])
 
         # do the math
+        db = nagiosCon.nagios
         last_count = db.nagios_check.find_one({'check': 'query_counts'})
+
         try:
             ts = int(time.time())
             diff_query = num - last_count['data'][query_type]['count']
